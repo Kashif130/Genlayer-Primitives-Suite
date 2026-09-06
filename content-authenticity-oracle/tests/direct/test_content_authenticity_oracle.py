@@ -15,9 +15,18 @@ TWEET_FEE = 1 * 10**15
 VALID_URL = "https://example.com/articles/some-story"
 
 
+PUBLIC_DNS_ANSWER = '{"Status":0,"Answer":[{"type":1,"data":"93.184.216.34"}]}'
+PRIVATE_DNS_ANSWER = '{"Status":0,"Answer":[{"type":1,"data":"169.254.169.254"}]}'
+NO_DNS_ANSWER = '{"Status":3,"Answer":[]}'
+
+
 def mock_full(direct_vm, ai="LIKELY_HUMAN", plag="LIKELY_ORIGINAL", fact="ACCURATE",
               matched="", reason="Clear evidence across all sources."):
     direct_vm.clear_mocks()
+    # Every consensus round now resolves content_url's host via a DNS-over-HTTPS check before
+    # ever rendering it (see _host_resolves_public) -- an ordinary public resolution here lets
+    # the round proceed exactly as before this safeguard was added.
+    direct_vm.mock_web(r".*dns\.google/resolve.*", {"status": 200, "body": PUBLIC_DNS_ANSWER})
     direct_vm.mock_web(r"https://example\.com.*", {"status": 200, "body": "<html>Article body text.</html>"})
     direct_vm.mock_web(
         r".*news\.google\.com.*",
@@ -38,7 +47,25 @@ def mock_full(direct_vm, ai="LIKELY_HUMAN", plag="LIKELY_ORIGINAL", fact="ACCURA
 
 def mock_content_unavailable(direct_vm):
     direct_vm.clear_mocks()
+    direct_vm.mock_web(r".*dns\.google/resolve.*", {"status": 200, "body": PUBLIC_DNS_ANSWER})
     direct_vm.mock_web(r"https://example\.com.*", {"status": 500, "body": ""})
+
+
+def mock_dns_resolves_private(direct_vm):
+    """example.com's own denylist/IP-literal checks all pass at request time -- this simulates
+    the residual case the static checks cannot catch: an ordinary hostname that resolves, at
+    fetch time, to a private/metadata address."""
+    direct_vm.clear_mocks()
+    direct_vm.mock_web(r".*dns\.google/resolve.*", {"status": 200, "body": PRIVATE_DNS_ANSWER})
+    direct_vm.mock_web(r"https://example\.com.*", {"status": 200, "body": "<html>Article body text.</html>"})
+
+
+def mock_redirect_to_unvalidated_target(direct_vm):
+    """example.com resolves publicly, but the URL itself answers with a redirect status --
+    _no_unresolved_redirect must refuse this rather than silently trusting wherever it points."""
+    direct_vm.clear_mocks()
+    direct_vm.mock_web(r".*dns\.google/resolve.*", {"status": 200, "body": PUBLIC_DNS_ANSWER})
+    direct_vm.mock_web(r"https://example\.com.*", {"status": 302, "body": ""})
 
 
 def request(contract, direct_vm, requester, url=VALID_URL, content_type="ARTICLE",
@@ -233,6 +260,32 @@ def test_run_assessment_content_unavailable_is_insufficient(contract, direct_vm,
     a = contract.get_assessment(aid)
     assert a["status"] == "INSUFFICIENT_EVIDENCE"
     assert a["ai_generated_verdict"] == ""
+
+
+def test_run_assessment_blocks_hostname_resolving_to_private_ip(contract, direct_vm, direct_bob, direct_carol):
+    """content_url passes every static check at request time (it's a well-formed, non-IP-literal
+    public-looking hostname) -- this exercises the fetch-target safeguard that only a live DNS
+    resolution inside the consensus round itself can enforce."""
+    warp_to(direct_vm, NOW)
+    aid = request(contract, direct_vm, direct_bob)
+    mock_dns_resolves_private(direct_vm)
+    direct_vm.sender = direct_carol
+    contract.run_assessment(aid)
+    a = contract.get_assessment(aid)
+    assert a["status"] == "INSUFFICIENT_EVIDENCE"
+    assert a["source_a_summary"] == "[FETCH_UNAVAILABLE]"
+
+
+def test_run_assessment_blocks_redirect_status(contract, direct_vm, direct_bob, direct_carol):
+    """content_url's host resolves publicly, but the URL itself answers with a 3xx -- the
+    contract must refuse rather than silently trust wherever that redirect points."""
+    warp_to(direct_vm, NOW)
+    aid = request(contract, direct_vm, direct_bob)
+    mock_redirect_to_unvalidated_target(direct_vm)
+    direct_vm.sender = direct_carol
+    contract.run_assessment(aid)
+    a = contract.get_assessment(aid)
+    assert a["status"] == "INSUFFICIENT_EVIDENCE"
 
 
 def test_run_assessment_downgrades_out_of_enum_verdict(contract, direct_vm, direct_bob, direct_carol):
