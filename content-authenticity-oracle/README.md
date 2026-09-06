@@ -109,10 +109,20 @@ browse flagged content) is a natural next step but is not included here.
   passage from a source neither indexes will correctly resolve to `UNCERTAIN` rather than a false
   `LIKELY_ORIGINAL` -- but it also means genuine plagiarism from an obscure source may go
   undetected. This is a real recall limitation of using only fixed, safe evidence sources.
-- **`content_url` host validation cannot see server-side redirects.** `_require_safe_url` rejects
-  local/private/link-local/reserved hosts and known URL-shortener/redirector domains at submission
-  time (see `_require_public_host`), but `gl.nondet.web.render` is an opaque non-deterministic
-  call this contract's code never observes the response/redirect chain of -- a public host that
-  itself later redirects server-side to a private target is outside what URL-string validation
-  alone can prevent. Blocking known redirector services closes the one practical vector this
-  contract can control at its own layer.
+- **`content_url`'s fetch-target safeguard is layered, not just a submission-time denylist.**
+  `_require_safe_url`/`_require_public_host` reject local/private/link-local/reserved hosts,
+  known IP-literal obfuscation tricks, and known URL-shortener/redirector domains at submission
+  time -- but a static, deterministic check can never see where an *ordinary-looking* hostname
+  actually resolves, or what an HTTP response actually redirects to, since both are only knowable
+  by live network access, which is a non-deterministic operation. `_host_resolves_public` closes
+  the first gap with a real DNS-over-HTTPS resolution check, and `_no_unresolved_redirect` closes
+  the second by refusing any 3xx status, both running inside the consensus round itself
+  (`_consensus_assessment`'s leader()) immediately before content_url is ever rendered, both
+  failing closed to `[FETCH_UNAVAILABLE]`. What remains open, stated plainly rather than silently
+  assumed away: if the GenVM web primitives follow HTTP redirects internally before returning a
+  response to contract code at all, this contract never observes the intermediate 3xx status to
+  refuse it, and a host that passed both checks could still ultimately serve content from a
+  redirect target this contract never validated. Fully closing that residual requires a
+  platform-level capability outside what a contract can implement on its own -- either disabling
+  automatic redirect-following in `gl.nondet.web.request`/`render`, or exposing the resolved
+  IP/redirect chain to contract code. See DECISION.md for the full reasoning.
