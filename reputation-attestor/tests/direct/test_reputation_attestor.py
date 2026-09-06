@@ -16,11 +16,20 @@ def _code(subject) -> str:
     return str(subject).lower()
 
 
+PUBLIC_DNS_ANSWER = '{"Status":0,"Answer":[{"type":1,"data":"93.184.216.34"}]}'
+PRIVATE_DNS_ANSWER = '{"Status":0,"Answer":[{"type":1,"data":"169.254.169.254"}]}'
+
+
 def mock_full(direct_vm, subject, gh="HIGH", tw="MEDIUM", hk="LOW"):
     """Mocks all three sources as fetchable AND carrying `subject`'s proof code -- the shape a
     genuine, subject-controlled set of evidence pages would take."""
     code = _code(subject)
     direct_vm.clear_mocks()
+    # twitter_url/hackathon_url are the caller-influenced fetch targets; every verification
+    # round now resolves their hosts via a DNS-over-HTTPS check before rendering them (see
+    # _host_resolves_public). github_url is exempt -- the contract only ever fetches a fixed
+    # api.github.com host it builds itself, never twitter_url's/hackathon_url's own host.
+    direct_vm.mock_web(r".*dns\.google/resolve.*", {"status": 200, "body": PUBLIC_DNS_ANSWER})
     direct_vm.mock_web(
         r".*api\.github\.com/users/.*",
         {"status": 200, "body": f'{{"public_repos":40,"followers":300,"bio":"proof:{code}"}}'},
@@ -47,6 +56,7 @@ def mock_full_no_proof(direct_vm, gh="HIGH", tw="MEDIUM", hk="LOW"):
     is registering them. This is exactly the shape of a profile-impersonation attempt: the pages
     are real and fetchable, but nothing on them ties them to the registrant's address."""
     direct_vm.clear_mocks()
+    direct_vm.mock_web(r".*dns\.google/resolve.*", {"status": 200, "body": PUBLIC_DNS_ANSWER})
     direct_vm.mock_web(
         r".*api\.github\.com/users/.*",
         {"status": 200, "body": '{"public_repos":400,"followers":9000}'},
@@ -70,6 +80,7 @@ def mock_full_no_proof(direct_vm, gh="HIGH", tw="MEDIUM", hk="LOW"):
 def mock_github_down(direct_vm, subject, tw="LOW", hk="LOW"):
     code = _code(subject)
     direct_vm.clear_mocks()
+    direct_vm.mock_web(r".*dns\.google/resolve.*", {"status": 200, "body": PUBLIC_DNS_ANSWER})
     direct_vm.mock_web(r".*api\.github\.com/users/.*", {"status": 500, "body": ""})
     direct_vm.mock_web(
         r"https://x\.com/.*", {"status": 200, "body": f"profile page text. verification code: {code}"}
@@ -83,6 +94,58 @@ def mock_github_down(direct_vm, subject, tw="LOW", hk="LOW"):
         f'{{"github_activity_level":"NONE","github_summary":"",'
         f'"twitter_activity_level":"{tw}","twitter_summary":"low twitter",'
         f'"hackathon_activity_level":"{hk}","hackathon_summary":"small mention"}}',
+    )
+
+
+def mock_hackathon_dns_resolves_private(direct_vm, subject, gh="HIGH", tw="MEDIUM"):
+    """hackathon_url passes every static check at registration time (well-formed, non-IP-literal,
+    public-looking hostname) -- this exercises the fetch-target safeguard that only a live DNS
+    resolution inside the consensus round itself can enforce. Twitter still resolves publicly,
+    so this isolates the hackathon component specifically."""
+    code = _code(subject)
+    direct_vm.clear_mocks()
+    direct_vm.mock_web(r".*dns\.google/resolve.*name=devpost\.com.*", {"status": 200, "body": PRIVATE_DNS_ANSWER})
+    direct_vm.mock_web(r".*dns\.google/resolve.*", {"status": 200, "body": PUBLIC_DNS_ANSWER})
+    direct_vm.mock_web(
+        r".*api\.github\.com/users/.*",
+        {"status": 200, "body": f'{{"public_repos":40,"followers":300,"bio":"proof:{code}"}}'},
+    )
+    direct_vm.mock_web(
+        r"https://x\.com/.*",
+        {"status": 200, "body": f"profile page text. verification code: {code}"},
+    )
+    direct_vm.mock_web(
+        r"https://devpost\.com/.*",
+        {"status": 200, "body": f"won 1st place at ETHGlobal. verification code: {code}"},
+    )
+    direct_vm.mock_llm(
+        r".*scoring three independent pieces of public evidence.*",
+        f'{{"github_activity_level":"{gh}","github_summary":"active github",'
+        f'"twitter_activity_level":"{tw}","twitter_summary":"moderate twitter",'
+        f'"hackathon_activity_level":"NONE","hackathon_summary":""}}',
+    )
+
+
+def mock_twitter_redirect(direct_vm, subject, gh="HIGH", hk="LOW"):
+    """twitter_url resolves publicly, but the URL itself answers with a redirect status --
+    _no_unresolved_redirect must refuse this rather than silently trust wherever it points."""
+    code = _code(subject)
+    direct_vm.clear_mocks()
+    direct_vm.mock_web(r".*dns\.google/resolve.*", {"status": 200, "body": PUBLIC_DNS_ANSWER})
+    direct_vm.mock_web(
+        r".*api\.github\.com/users/.*",
+        {"status": 200, "body": f'{{"public_repos":40,"followers":300,"bio":"proof:{code}"}}'},
+    )
+    direct_vm.mock_web(r"https://x\.com/.*", {"status": 302, "body": ""})
+    direct_vm.mock_web(
+        r"https://devpost\.com/.*",
+        {"status": 200, "body": f"won 1st place at ETHGlobal. verification code: {code}"},
+    )
+    direct_vm.mock_llm(
+        r".*scoring three independent pieces of public evidence.*",
+        f'{{"github_activity_level":"{gh}","github_summary":"active github",'
+        f'"twitter_activity_level":"NONE","twitter_summary":"",'
+        f'"hackathon_activity_level":"{hk}","hackathon_summary":"one hackathon win"}}',
     )
 
 
@@ -279,6 +342,38 @@ def test_verify_reputation_partial_failure_is_non_destructive(contract, direct_v
     assert rep["twitter_score"] == 300
 
 
+def test_verify_blocks_hackathon_hostname_resolving_to_private_ip(contract, direct_vm, direct_bob, direct_carol):
+    """hackathon_url passes every static check at registration time -- this exercises the
+    fetch-target safeguard that only a live DNS resolution inside the consensus round itself
+    can enforce. The hackathon component must be left UNVERIFIED, exactly like any other
+    unreachable source, while github/twitter still update normally."""
+    register(contract, direct_vm, direct_bob)
+    warp_to(direct_vm, NOW)
+    mock_hackathon_dns_resolves_private(direct_vm, direct_bob)
+    direct_vm.sender = direct_carol
+    contract.verify_reputation(direct_bob)
+    rep = contract.get_reputation(direct_bob)
+    assert rep["hackathon_status"] == "UNVERIFIED"
+    assert rep["hackathon_score"] == 0
+    assert rep["github_status"] == "VERIFIED"
+    assert rep["twitter_status"] == "VERIFIED"
+
+
+def test_verify_blocks_twitter_redirect_status(contract, direct_vm, direct_bob, direct_carol):
+    """twitter_url's host resolves publicly, but the URL itself answers with a 3xx -- the
+    contract must refuse rather than silently trust wherever that redirect points."""
+    register(contract, direct_vm, direct_bob)
+    warp_to(direct_vm, NOW)
+    mock_twitter_redirect(direct_vm, direct_bob)
+    direct_vm.sender = direct_carol
+    contract.verify_reputation(direct_bob)
+    rep = contract.get_reputation(direct_bob)
+    assert rep["twitter_status"] == "UNVERIFIED"
+    assert rep["twitter_score"] == 0
+    assert rep["github_status"] == "VERIFIED"
+    assert rep["hackathon_status"] == "VERIFIED"
+
+
 def test_verify_reputation_requires_cooldown(contract, direct_vm, direct_bob, direct_carol):
     register(contract, direct_vm, direct_bob)
     warp_to(direct_vm, NOW)
@@ -341,6 +436,7 @@ def test_out_of_enum_activity_level_defaults_to_none(contract, direct_vm, direct
     warp_to(direct_vm, NOW)
     code = str(direct_bob).lower()
     direct_vm.clear_mocks()
+    direct_vm.mock_web(r".*dns\.google/resolve.*", {"status": 200, "body": PUBLIC_DNS_ANSWER})
     direct_vm.mock_web(r".*api\.github\.com/users/.*", {"status": 200, "body": f"proof:{code}"})
     direct_vm.mock_web(r"https://x\.com/.*", {"status": 200, "body": f"text proof:{code}"})
     direct_vm.mock_web(r"https://devpost\.com/.*", {"status": 200, "body": f"text proof:{code}"})
@@ -385,6 +481,7 @@ def test_verify_credits_only_components_with_proof_code(contract, direct_vm, dir
     warp_to(direct_vm, NOW)
     code = str(direct_bob).lower()
     direct_vm.clear_mocks()
+    direct_vm.mock_web(r".*dns\.google/resolve.*", {"status": 200, "body": PUBLIC_DNS_ANSWER})
     direct_vm.mock_web(
         r".*api\.github\.com/users/.*",
         {"status": 200, "body": f'{{"public_repos":40,"followers":300,"bio":"proof:{code}"}}'},
