@@ -2,6 +2,7 @@
 
 from genlayer import *
 from dataclasses import dataclass
+import json
 
 ERROR_EXPECTED = "[EXPECTED]"
 ERROR_TRANSIENT = "[TRANSIENT]"
@@ -37,6 +38,17 @@ ERROR_LLM = "[LLM_ERROR]"
 # sources (Google News, Wikipedia) remain contract-fixed and keyword-driven exactly as in
 # CoverMesh, so the open-fetch-proxy surface is limited to exactly one, tightly-validated URL per
 # assessment, never an arbitrary number of caller-chosen endpoints.
+#
+# Static, syntax-level validation cannot catch every SSRF shape, though: an ordinary-looking
+# hostname can still resolve to a private/loopback/link-local/cloud-metadata address, and a
+# syntactically public host can still respond with a redirect to one. Neither is discoverable
+# without actually resolving/requesting the URL, which is a non-deterministic operation and so
+# can only run inside a consensus-gated block -- see `_host_resolves_public` and
+# `_no_unresolved_redirect`, called from `_consensus_assessment`'s leader() immediately before
+# content_url is ever rendered. Both fail closed to "[FETCH_UNAVAILABLE]". The one gap that
+# remains even after this -- a redirect the GenVM web primitives might follow internally before
+# this contract ever sees the intermediate status code -- is a platform-level limitation, not
+# something left unaddressed; it is documented in DECISION.md rather than silently assumed away.
 # ---------------------------------------------------------------------------
 
 CONTENT_TYPE_ARTICLE = "ARTICLE"
@@ -341,7 +353,7 @@ class ContentAuthenticityOracle(gl.Contract):
         needs_corroboration: bool, min_sources: int,
     ) -> dict:
         def leader():
-            content_page = self._safe_render(content_url, cap=6000)
+            content_page = self._safe_render_checked(content_url, cap=6000)
             content_available = content_page != "[FETCH_UNAVAILABLE]"
 
             news_page = "[NOT_FETCHED]"
@@ -525,6 +537,104 @@ fetched, all requested checks must resolve to their uncertain value.
         except Exception:
             return "[FETCH_UNAVAILABLE]"
 
+    # -- consensus-time fetch-target safeguard --------------------------------------------
+    # _require_safe_url/_require_public_host run at request_assessment time, on the
+    # deterministic write path, so they can only catch a caller-supplied hostname that is
+    # ITSELF an IP literal (in any of its decimal/octal/hex/obfuscated forms) or matches a
+    # known-bad name (localhost, .internal, a known URL-shortener, ...). They cannot catch an
+    # ordinary-looking hostname that simply resolves to a private, loopback, link-local, or
+    # cloud-metadata address, nor a syntactically public host that returns a redirect to one --
+    # both of those can only be discovered by actually resolving/requesting the URL, which is a
+    # non-deterministic operation and therefore can only run inside a consensus-gated block, not
+    # on the deterministic request path. This is why the checks below run here, inside
+    # _consensus_assessment's leader(), immediately before content_url is ever rendered, instead
+    # of being folded into _require_safe_url.
+    #
+    # Both checks fail closed: any resolution failure, empty/unrecognized DNS answer, or
+    # observed redirect status is treated the same as an unreachable source
+    # ("[FETCH_UNAVAILABLE]"), which safely downgrades the assessment to INSUFFICIENT_EVIDENCE
+    # rather than ever rendering an unresolved-target URL.
+    #
+    # Residual limitation, stated plainly rather than silently assumed away: if the GenVM web
+    # primitives follow HTTP redirects internally before returning a response to contract code
+    # (rather than surfacing the intermediate 3xx status the way gl.nondet.web.request's
+    # documented status_code field implies they might), a host that passes both checks here
+    # could still have its content served from a redirect target this contract never sees or
+    # validates. Fully closing that gap needs a platform-level capability this contract cannot
+    # implement on its own -- either disabling automatic redirect-following in
+    # gl.nondet.web.request/render, or exposing the resolved IP/redirect chain to contract code --
+    # and is called out explicitly in DECISION.md rather than claimed as solved.
+
+    def _resolve_ips(self, host: str, record_type: str) -> list:
+        query = f"https://dns.google/resolve?name={self._url_encode_component(host)}&type={record_type}"
+        try:
+            raw = str(gl.nondet.web.render(query, mode="text"))[:4000]
+        except Exception:
+            return []
+        want_type = 1 if record_type == "A" else 28
+        return self._extract_dns_answer_ips(raw, want_type)
+
+    def _extract_dns_answer_ips(self, raw: str, want_type: int) -> list:
+        ips = []
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return ips
+        if not isinstance(data, dict):
+            return ips
+        answers = data.get("Answer", [])
+        if not isinstance(answers, list):
+            return ips
+        for entry in answers:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("type") != want_type:
+                continue
+            value = entry.get("data")
+            if isinstance(value, str) and value != "":
+                ips.append(value)
+        return ips
+
+    def _host_resolves_public(self, host: str) -> bool:
+        core = host[1:-1] if (host.startswith("[") and host.endswith("]")) else host
+        literal_v4 = self._parse_ipv4_literal(core)
+        if literal_v4 is not None:
+            return not self._is_non_public_ipv4(literal_v4)
+        if ":" in core:
+            return not self._is_non_public_ipv6(core)
+
+        all_ips = self._resolve_ips(core, "A") + self._resolve_ips(core, "AAAA")
+        if len(all_ips) == 0:
+            return False  # no usable resolution at all -- fail closed
+        for ip in all_ips:
+            v4 = self._parse_ipv4_literal(ip)
+            if v4 is not None:
+                if self._is_non_public_ipv4(v4):
+                    return False
+                continue
+            if ":" in ip:
+                if self._is_non_public_ipv6(ip):
+                    return False
+                continue
+            return False  # unrecognized answer shape -- fail closed
+        return True
+
+    def _no_unresolved_redirect(self, url: str) -> bool:
+        try:
+            response = gl.nondet.web.request(url, method="GET")
+            status = int(getattr(response, "status_code", 200))
+        except Exception:
+            return True  # an outright fetch failure is handled by the render call that follows
+        return not (300 <= status <= 399)
+
+    def _safe_render_checked(self, url: str, cap: int = 9000) -> str:
+        host = self._extract_host_from_url(url)
+        if host == "" or not self._host_resolves_public(host):
+            return "[FETCH_UNAVAILABLE]"
+        if not self._no_unresolved_redirect(url):
+            return "[FETCH_UNAVAILABLE]"
+        return self._safe_render(url, cap)
+
     def _require_assessment(self, assessment_id: str) -> Assessment:
         if assessment_id not in self.assessments:
             raise gl.vm.UserError(f"{ERROR_EXPECTED} Assessment does not exist")
@@ -570,15 +680,22 @@ fetched, all requested checks must resolve to their uncertain value.
         rest = url[scheme_end:]
         if rest == "" or rest[0] in ("/", "."):
             raise gl.vm.UserError(f"{ERROR_EXPECTED} content_url must include a host")
-        host_port = rest.split("/")[0].split("?")[0].split("#")[0]
-        if host_port.startswith("["):
-            end = host_port.find("]")
-            host = host_port[: end + 1] if end != -1 else host_port
-        else:
-            host = host_port.split(":")[0]
+        host = self._extract_host_from_url(url)
         if host == "":
             raise gl.vm.UserError(f"{ERROR_EXPECTED} content_url must include a host")
         self._require_public_host(host, "content_url")
+
+    def _extract_host_from_url(self, url: str) -> str:
+        if "://" not in url:
+            return ""
+        rest = url[url.index("://") + 3:]
+        if rest == "":
+            return ""
+        host_port = rest.split("/")[0].split("?")[0].split("#")[0]
+        if host_port.startswith("["):
+            end = host_port.find("]")
+            return host_port[: end + 1] if end != -1 else host_port
+        return host_port.split(":")[0]
 
     # -- non-public / redirector host hardening -------------------------------------------
     # content_url is this contract's one caller-influenced fetch surface (CoverMesh's own
