@@ -113,8 +113,44 @@ URL-shortener whose real destination isn't visible at submission time. `_require
 routes every URL (github/twitter/hackathon alike) through `_require_public_host`, which rejects
 localhost/private/link-local/reserved IPv4 and IPv6 literals -- including common decimal/hex/octal
 obfuscations of them -- plus a fixed list of known URL-shortener/redirector hosts. This closes the
-literal-SSRF surface at the contract's own validation layer; it cannot, by itself, prevent a
-public host from redirecting the underlying fetch elsewhere after the contract has already
-approved the URL string, since that fetch is an opaque nondet call this contract's code never
-observes the response chain of -- redirector-service blocking is the practical mitigation
-available for that residual risk.
+literal-SSRF surface at the contract's own validation layer.
+
+## Third-round hardening: the denylist alone was not enough
+
+A subsequent review correctly identified that the submission-time denylist above, however
+thorough, cannot close two real gaps: an *ordinary*, non-denylisted hostname can still resolve, at
+fetch time, to a private or cloud-metadata address (the classic DNS-based SSRF shape), and a
+syntactically public, non-denylisted URL can still answer with an HTTP redirect to one. Both are
+facts about live network behavior, not about the URL string itself, so no amount of additional
+denylisting at `register_profile`/`update_evidence` time could ever close them -- they can only be
+discovered by actually resolving or requesting the URL, which is a non-deterministic operation,
+and non-deterministic operations can only run inside a consensus-gated block, never on the
+deterministic write path those two methods run on. The fix could not be "check harder at
+registration time," it had to be "check for real, at fetch time, inside consensus" -- exactly the
+same architectural correction applied to ContentAuthenticityOracle's `content_url`.
+
+The fix adds two checks inside `_consensus_verify`'s `leader()`, run immediately before
+`twitter_url`/`hackathon_url` are ever rendered (`github_url` is exempt, since the contract only
+ever fetches a fixed `api.github.com` host it builds itself from the extracted username, never a
+caller-influenced host):
+
+- **`_host_resolves_public`** performs a real DNS-over-HTTPS lookup (via a fixed, trusted
+  resolver, `dns.google/resolve`) for both A and AAAA records, and validates every returned
+  address against the same private/reserved-range logic `_require_public_host` already used for
+  literal IPs.
+- **`_no_unresolved_redirect`** issues a `gl.nondet.web.request` and inspects `response.status_code`
+  before ever calling `.render()` on the same URL, refusing any response in the 300-399 range.
+
+Both checks fail closed to `"[FETCH_UNAVAILABLE]"`, which the existing per-component
+non-destructive verification logic already treats as "leave this component's prior score
+untouched this round" -- no new failure mode, just an evidence path that should never have been
+trusted in the first place now correctly recognized as untrustworthy.
+
+**What is still not closed, stated plainly:** if the GenVM web primitives internally follow HTTP
+redirects before ever returning a response to contract code, `_no_unresolved_redirect` never
+observes anything to refuse, and a host that passed both checks here could still ultimately serve
+content fetched from a redirect target this contract never validated. This is the edge of what is
+achievable without a platform capability this contract cannot build for itself -- either disabling
+automatic redirect-following in the web primitives, or exposing the resolved IP/redirect chain to
+contract code. Until such a capability exists, this is the most complete mitigation available at
+the Intelligent Contract layer, documented here rather than silently assumed to be complete.
