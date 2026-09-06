@@ -93,7 +93,47 @@ visible at submission time. `_require_safe_url` now additionally routes the pars
 `_require_public_host`, which rejects localhost/private/link-local/reserved IPv4 and IPv6
 literals -- including common decimal/hex/octal obfuscations of them -- plus a fixed list of known
 URL-shortener/redirector hosts. This closes the literal-SSRF surface at the contract's own
-validation layer; it cannot, by itself, prevent a public host from redirecting the underlying
-fetch elsewhere after the contract has already approved the URL string, since that fetch is an
-opaque nondet call this contract's code never observes the response chain of -- redirector-service
-blocking is the practical mitigation available for that residual risk.
+validation layer.
+
+## Second-round hardening: the denylist alone was not enough
+
+A subsequent review correctly identified that the submission-time denylist above, however
+thorough, cannot close two real gaps: an *ordinary*, non-denylisted hostname can still resolve, at
+fetch time, to a private or cloud-metadata address (the classic DNS-based SSRF shape), and a
+syntactically public, non-denylisted URL can still answer with an HTTP redirect to one. Both are
+facts about live network behavior, not about the URL string itself, so no amount of additional
+denylisting at `request_assessment` time could ever close them -- they can only be discovered by
+actually resolving or requesting the URL, which is a non-deterministic operation, and non-
+deterministic operations can only run inside a consensus-gated block (a `leader()` function passed
+to `gl.eq_principle.*`), never on the deterministic write path `request_assessment` runs on. This
+is a real architectural constraint, not a design preference: the fix could not be "check harder at
+submission time," it had to be "check for real, at fetch time, inside consensus."
+
+The fix adds two checks inside `_consensus_assessment`'s `leader()`, run immediately before
+`content_url` is ever rendered:
+
+- **`_host_resolves_public`** performs a real DNS-over-HTTPS lookup (via a fixed, trusted
+  resolver, `dns.google/resolve`) for both A and AAAA records, and validates every returned
+  address against the same private/reserved-range logic `_require_public_host` already used for
+  literal IPs. This directly closes the "ordinary hostname resolves to a private/metadata
+  address" gap: the check now reflects where the host *actually* resolves at the moment of
+  fetching, not just what its string looks like.
+- **`_no_unresolved_redirect`** issues a `gl.nondet.web.request` and inspects `response.status_code`
+  before ever calling `.render()` on the same URL, refusing any response in the 300-399 range
+  rather than silently trusting whatever a `.render()` call might return for a URL that redirects.
+
+Both checks fail closed: a resolution failure, an empty or unrecognized DNS answer, or an observed
+redirect status all downgrade `content_page` to `"[FETCH_UNAVAILABLE]"`, which the existing
+consensus logic already treats as missing evidence -- no new failure mode was introduced, this
+only closes an evidence path that should never have been trusted in the first place.
+
+**What is still not closed, stated plainly:** if the GenVM web primitives internally follow HTTP
+redirects before ever returning a response to contract code -- rather than surfacing the
+intermediate 3xx the way `gl.nondet.web.request`'s documented `status_code` field implies they
+might -- then `_no_unresolved_redirect` never observes anything to refuse, and a host that passed
+both checks here could still ultimately serve content fetched from a redirect target this contract
+never validated. This is not a gap this contract chose to leave open; it is the edge of what is
+achievable without a platform capability this contract cannot build for itself -- either disabling
+automatic redirect-following in the web primitives, or exposing the resolved IP/redirect chain to
+contract code. Until such a capability exists, this is the most complete mitigation available at
+the Intelligent Contract layer, and is documented here rather than silently assumed to be complete.
