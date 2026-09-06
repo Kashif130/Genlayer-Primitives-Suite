@@ -108,10 +108,19 @@ populate, browse the registry) is a natural next step but is not included here.
   separate reputation scores. This contract verifies that evidence is real, public, and actually
   controlled by the registering address (via the `get_verification_code` proof-of-control check);
   it does not and cannot prove a one-human-one-address property.
-- **Redirects are not followed at the contract's own validation layer.** `_require_public_host`
-  rejects local/private/link-local/reserved hosts and known URL-shortener/redirector domains at
-  submission time, but it cannot see what a public host's server ultimately does with the
-  request -- `gl.nondet.web.render` is an opaque non-deterministic call this contract's code never
-  observes the response/redirect chain of. Blocking known redirector services closes the one
-  practical vector this contract can control; a public host that itself later redirects
-  server-side to a private target is outside what URL-string validation alone can prevent.
+- **`twitter_url`/`hackathon_url`'s fetch-target safeguard is layered, not just a submission-time
+  denylist.** `_require_public_host` rejects local/private/link-local/reserved hosts, known
+  IP-literal obfuscation tricks, and known URL-shortener/redirector domains at registration time
+  -- but that static check can never see where an *ordinary-looking* hostname actually resolves,
+  or what an HTTP response actually redirects to, since both require live network access, which
+  is a non-deterministic operation. `_host_resolves_public` closes the first gap with a real
+  DNS-over-HTTPS resolution check, and `_no_unresolved_redirect` closes the second by refusing any
+  3xx status, both running inside the consensus round itself (`_consensus_verify`'s leader())
+  immediately before twitter_url/hackathon_url are ever rendered, both failing closed so that
+  component's prior score is left untouched this round rather than ever rendering an unresolved
+  target. (`github_url` is exempt: the contract only ever fetches a fixed `api.github.com` host it
+  builds itself, never a caller-influenced host.) What remains open, stated plainly: if the GenVM
+  web primitives follow HTTP redirects internally before returning a response to contract code at
+  all, this contract never observes the intermediate 3xx status to refuse it. Fully closing that
+  residual needs a platform-level capability outside what a contract can implement on its own. See
+  DECISION.md for the full reasoning.
