@@ -26,10 +26,13 @@ parties who have no visibility into whether a round is "in progress," so the wro
 here is different: if a single flaky fetch (a rate-limited GitHub API call, for instance) zeroed
 out a subject's entire score, every consuming protocol reading that score in the interim would see
 a false collapse in reputation that has nothing to do with the subject's actual evidence. The fix
-is to track each of the three components' own verified status and timestamp, and to only
-overwrite a component when its specific evidence was fetchable in the current round. This is a
-deliberate generalization of CoverMesh's `INSUFFICIENT_EVIDENCE` idea (never resolve on missing
-evidence) down to per-field granularity, rather than an all-or-nothing round.
+is to track each of the three components' own verified status and timestamp, and to leave a
+component's prior state completely untouched only when its evidence genuinely could not be
+fetched this round. This is a deliberate generalization of CoverMesh's `INSUFFICIENT_EVIDENCE`
+idea (never resolve on missing evidence) down to per-field granularity, rather than an
+all-or-nothing round -- but "missing evidence" has to mean the fetch itself failed, not merely
+that the fetched page no longer says what it used to (see the fourth-round hardening below, where
+conflating those two was a real bug).
 
 ## Why registration is self-only but verification is permissionless
 
@@ -154,3 +157,56 @@ achievable without a platform capability this contract cannot build for itself -
 automatic redirect-following in the web primitives, or exposing the resolved IP/redirect chain to
 contract code. Until such a capability exists, this is the most complete mitigation available at
 the Intelligent Contract layer, documented here rather than silently assumed to be complete.
+
+## Fourth-round hardening: fetched-but-unproven was wrongly treated the same as unreachable
+
+A subsequent review correctly identified that the non-destructive verification path described
+above -- built to protect subjects from a transient fetch failure wiping out their score -- had
+been applied one step too broadly. The original code checked a single `*_available` boolean per
+component (fetched **and** proof-code-bearing) and left the component untouched whenever it was
+`False`, for *either* reason: the page could not be fetched at all, or the page fetched fine but
+no longer contained the subject's proof code. Those are not the same fact. A page that is real,
+reachable, and simply no longer endorses this address is not "missing evidence" the way an
+API outage is -- it is a subject who once proved control and then removed that proof, and the
+non-destructive design's entire justification (don't let a transient hiccup destroy real,
+still-true evidence) does not apply to it: the evidence didn't hiccup, it changed. Treating the
+two the same meant a subject could verify once with a genuine proof code, then quietly delete it,
+and keep the resulting score indefinitely -- exactly the kind of stale-but-never-revalidated claim
+a reusable, continuously-read primitive cannot afford to make.
+
+The fix splits the single boolean into two, both already computed deterministically in
+`leader()` and both validated by consensus like any other evidence-derived fact: `*_fetched`
+(did the render succeed) and `*_available` (fetched **and** proof-code-bearing, as before).
+`verify_reputation` now branches on both: `available` writes a fresh VERIFIED score exactly as
+before; `fetched` but not `available` **clears** that component's score to zero and its status to
+`UNVERIFIED`, with the timestamp updated to record that a real check ran and found nothing; only
+truly unreachable (`not fetched`) leaves the component untouched. This preserves the original
+non-destructive guarantee for the case it was actually meant to cover (transient failures) while
+closing the gap it accidentally created (evidence that changed).
+
+**Why this couldn't be fixed by simply always overwriting on any `False`.** Reverting to
+"overwrite on any non-available outcome" would restore the destructive behavior the non-
+destructive design exists to prevent: a single rate-limited GitHub API call would zero out a
+subject's real, still-valid score. The fix had to add a third state, not remove the second one.
+
+## Fourth-round hardening: keeper rewards must be earned, not merely triggered
+
+The same review identified a second issue with the same root cause: `verify_reputation` paid its
+fixed keeper reward on every call with sufficient pool funds, regardless of what the round
+actually found. This is reasonable in isolation -- a legitimate profile might genuinely come back
+partially or fully unreachable sometimes, and the keeper still did real work fetching it -- but
+combined with the bug above, it created a profitable Sybil pattern: register any number of
+profiles pointing at real, fetchable pages that simply never carry a proof code (no registration-
+time check can distinguish this from a legitimate subject who hasn't added their code yet), then
+repeatedly call `verify_reputation` on them. Each call would report a plausible-looking round
+(pages fetched, activity levels estimated) and still collect the keeper reward, even though no
+component could ever possibly become `VERIFIED` -- a free, repeatable drain on `reward_pool`
+funded by whoever tops it up in good faith.
+
+The fix ties the reward to outcome, not to effort: `verify_reputation` now tracks whether *any*
+component achieved a genuine `available` outcome this round, and only pays the keeper reward if
+so. A round that only clears stale components or leaves unreachable ones untouched -- the two
+outcomes that are, by construction, never accompanied by a real proof-code match -- earns
+nothing. This does not require every component to verify, only at least one, so a legitimate
+profile with one flaky source among three genuine ones still rewards the keeper who checked it;
+it only closes the reward for rounds that could not possibly have produced real evidence.
