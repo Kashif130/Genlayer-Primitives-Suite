@@ -15,9 +15,10 @@ pipeline: a shared "proof of work" layer for the rest of this ecosystem.
   -> the subject places their own `get_verification_code` string somewhere on each linked page
   (GitHub bio, X/Twitter bio, hackathon page) to prove they actually control it -> anyone
   permissionlessly triggers `verify_reputation`, which independently checks all three evidence
-  sources in one bounded consensus round and updates whichever component was both fetchable and
-  carried the proof code this round -> any protocol reads the composite score forever via
-  `get_reputation`.
+  sources in one bounded consensus round: a component that is fetched AND carries the proof code
+  gets a fresh VERIFIED score, one that is fetched but no longer carries it gets CLEARED to
+  UNVERIFIED/zero, and one that could not be fetched at all is left untouched -> any protocol
+  reads the composite score forever via `get_reputation`.
 
 ## The core design choice: reputation is read repeatedly, so a bad round must never destroy data
 
@@ -29,10 +30,44 @@ didn't render this round) must never wipe out a subject's previously-verified st
 
 This is why each of the three score components -- `github_score`, `twitter_score`,
 `hackathon_score` -- tracks its **own** `_status` (`VERIFIED`/`UNVERIFIED`) and
-`_last_verified_at` timestamp, and `verify_reputation` only overwrites a component when that
-specific evidence source was actually fetchable in the current round. A GitHub outage during an
-otherwise-successful verification leaves the subject's GitHub score exactly as it was, while their
-Twitter and hackathon scores still get a fresh update in the same call.
+`_last_verified_at` timestamp. But "the page didn't come back" and "the page came back and no
+longer proves this subject controls it" are different facts, and `verify_reputation` treats them
+differently on purpose:
+
+- **Genuinely unreachable this round** (the fetch itself failed) -> that component's prior score,
+  status, and timestamp are left completely untouched. A GitHub outage during an otherwise-
+  successful verification leaves the subject's GitHub score exactly as it was, while their
+  Twitter and hackathon scores still get a fresh update in the same call.
+- **Fetched successfully, but the subject's proof code is no longer present** -> that component's
+  score is **cleared** back to zero and its status back to `UNVERIFIED`, with the timestamp
+  updated to reflect that a real check ran and found nothing. The page is real and reachable; it
+  simply no longer endorses this address, so keeping the old score would mean trusting evidence
+  that no longer exists. Collapsing this case into "leave it untouched" (the same treatment as a
+  genuine fetch failure) was a real bug caught in review: it let a subject verify once with a real
+  proof code, then quietly remove it, and keep the resulting score forever.
+
+## Why fetched-but-unproven and unreachable get different treatment
+
+See `_consensus_verify`'s `leader()`: every source's outcome carries two independent booleans,
+`*_fetched` (did the render succeed at all) and `*_available` (fetched **and** contains the
+subject's proof code). `verify_reputation` branches on both: `available` -> write a fresh VERIFIED
+score; `fetched` but not `available` -> clear to UNVERIFIED/zero; neither -> leave untouched. Both
+facts are validated by consensus like any other evidence-derived fact -- a page's reachability and
+its proof-code containment are deterministic, code-level checks (never a model judgment), so
+validators agree on them the same way they agree on everything else this contract checks.
+
+## Why the keeper reward is gated on an actual verified update
+
+`verify_reputation` used to pay its fixed keeper reward on every call that had pool funds
+available, regardless of outcome -- reasonable for a genuine profile that might legitimately come
+back `INSUFFICIENT`/unreachable sometimes, but it also meant a Sybil operator could register any
+number of profiles pointing at real, fetchable pages that simply never carry a proof code, and
+drain `reward_pool` for free by repeatedly triggering verification on them: the round "did work"
+from the caller's perspective even though it could never possibly produce a verified score. The
+reward is now paid only when at least one component achieves a genuine `available` (fetched AND
+proof-code-bearing) outcome in that round -- a round that only ever clears or leaves components
+untouched earns nothing, closing that drain without changing the reward for any legitimate
+profile that actually verifies.
 
 ## Why evidence-link registration is self-only, but verification is permissionless
 
@@ -63,7 +98,7 @@ underlying asset) can top up.
 | --- | --- | --- | --- |
 | `register_profile(...)` | write, self-only | No | Registers a subject's own evidence links (one-time). |
 | `update_evidence(...)` | write, self-only | No | Updates evidence links; never itself changes a score. Any component whose URL actually changes is immediately reset to UNVERIFIED (score/status/summary/timestamp cleared) rather than left stale. |
-| `verify_reputation(subject)` | write, permissionless | **Yes -- once per attempt** | Runs the bounded consensus round. A component is only credited if it was BOTH fetchable AND its fetched text contains the subject's proof code (see `get_verification_code`) -- proving the subject actually controls that page, not just that the URL resolves. |
+| `verify_reputation(subject)` | write, permissionless | **Yes -- once per attempt** | Runs the bounded consensus round. A component is only credited if it was BOTH fetchable AND its fetched text contains the subject's proof code (see `get_verification_code`); if it's fetchable but the code is gone, that component is cleared to UNVERIFIED/zero instead of left stale; only a genuine fetch failure leaves it untouched. Pays the keeper reward only if at least one component was genuinely (re-)verified this round. |
 | `fund_rewards()` | payable write, permissionless | No | Tops up the keeper-reward pool. |
 | `blacklist_profile` / `unblacklist_profile` | admin-only write | No | Emergency lever for clear abuse; zeroes/restores the readable score. |
 | `get_reputation(subject)` | view | No | The reusable read primitive: composite score + per-component breakdown. |
